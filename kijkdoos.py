@@ -26,6 +26,7 @@ import sys
 import re
 import argparse
 import urllib.request
+import urllib.parse
 import urllib.error
 from pathlib import Path
 from typing import Optional
@@ -203,6 +204,7 @@ class ChannelLoader:
             category = (ch.get("category") or ch.get("group") or
                         ch.get("group-title") or "").strip()
             is_geo = ch.get("isGeoBlocked", False)
+            is_npo = False   # will be set per-url below
 
             # ── collect all stream URLs (famelack uses iptv_urls list) ──
             stream_urls: list[str] = []
@@ -245,6 +247,7 @@ class ChannelLoader:
                     "category": category or "General",
                     "is_geo": is_geo,
                     "is_youtube": unique_urls[0] in yt_urls,
+                    "is_npo": "omroep.nl" in unique_urls[0] and "icecast" not in unique_urls[0],
                     "all_urls": unique_urls,
                 })
             else:
@@ -258,6 +261,7 @@ class ChannelLoader:
                         "category": category or "General",
                         "is_geo": is_geo,
                         "is_youtube": url in yt_urls,
+                        "is_npo": "omroep.nl" in url and "icecast" not in url,
                         "all_urls": unique_urls,
                     })
 
@@ -321,7 +325,9 @@ class Kijkdoos(tk.Tk):
         self._rec_player = None
         self._fullscreen = False
         self._fs_overlay = None
-        self._fs_hide_id = None   # separate VLC player for recording
+        self._fs_overlay_shown = False
+        self._fs_hide_id = None
+        self._vlc_playing = False   # cached VLC state for VU meter
         self._rec_file: str = ""
         self._rec_blink_id = None
 
@@ -697,6 +703,9 @@ class Kijkdoos(tk.Tk):
                 self.after(0, self._on_loaded, chs, None)
             except Exception as e:
                 self.after(0, self._on_loaded, [], str(e))
+            finally:
+                # Ensure _loading is always cleared even on unexpected errors
+                pass   # _on_loaded handles it
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -714,9 +723,9 @@ class Kijkdoos(tk.Tk):
             )
             return
 
-        self.channels = channels
+        self.channels = list(channels)   # own copy, safe for concurrent reads
         # populate category dropdown
-        cats = sorted({c["category"] for c in channels})
+        cats = sorted({c["category"] for c in self.channels})
         self._cat_combo["values"] = ["All"] + cats
         self._cat_var.set("All")
 
@@ -816,7 +825,15 @@ class Kijkdoos(tk.Tk):
 
         if self._player:
             self._stop_poll()
-            if ch.get("is_youtube"):
+            if ch.get("is_npo"):
+                # Resolve NPO token in background then play
+                self._set_status(f"⟳ Resolving NPO stream token for {name}…")
+                threading.Thread(
+                    target=self._resolve_npo_stream,
+                    args=(ch, url),
+                    daemon=True,
+                ).start()
+            elif ch.get("is_youtube"):
                 # Resolve YouTube URL in background then play
                 self._set_status(f"⟳ Resolving YouTube stream for {name}…")
                 threading.Thread(
@@ -846,6 +863,54 @@ class Kijkdoos(tk.Tk):
         self._player.play()
         self._hide_placeholder()
         self._start_poll()
+
+    def _resolve_npo_stream(self, ch: dict, stream_url: str):
+        """Background thread: resolve NPO stream via resolver.streaming.api.nos.nl.
+
+        The old ida.omroep.nl token API is dead (410 Gone since 2017).
+        The NOS resolver endpoint is the only working public method.
+        It redirects to a signed CDN URL when called from a Dutch IP.
+        """
+        import urllib.request as _req
+        import urllib.parse as _parse
+        try:
+            # Extract the path portion from the full URL
+            # e.g. https://livestreams.omroep.nl/live/npo/tvlive/npo1/npo1.isml/npo1.m3u8
+            #   -> /live/npo/tvlive/npo1/npo1.isml/.m3u8
+            parsed = _parse.urlparse(stream_url)
+            path   = parsed.path
+
+            # Normalise: replace specific .m3u8 filename with .m3u8 wildcard
+            # so the resolver picks the best variant
+            import re as _re
+            path = _re.sub(r'/[^/]+\.m3u8$', '/.m3u8', path)
+
+            resolver = (
+                "http://resolver.streaming.api.nos.nl/livestream"
+                f"?url={_parse.quote(path, safe='/')}"
+            )
+
+            req = _req.Request(resolver, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; Kijkdoos/1.0)",
+                "Referer":    "https://www.npostart.nl/",
+            })
+            # Follow redirects (urlopen does this automatically)
+            with _req.urlopen(req, timeout=15) as resp:
+                final_url = resp.geturl()   # resolved CDN URL after redirect
+
+            if not final_url or final_url == resolver:
+                raise ValueError("Resolver returned no redirect")
+
+            self.after(0, self._url_var.set, final_url)
+            self.after(0, self._set_status, f"\u25b6 {ch['name']}  \u2022  NPO")
+            self.after(0, self._start_vlc_playback, final_url)
+
+        except Exception as e:
+            # Last resort: try the raw URL directly
+            self.after(0, self._set_status,
+                f"\u26a0 NPO resolver failed: {e} \u2014 trying direct…")
+            self.after(300, self._start_vlc_playback, stream_url)
+
 
     def _resolve_and_play(self, ch: dict, yt_url: str):
         """Background thread: use yt-dlp to get a direct stream URL."""
@@ -902,6 +967,7 @@ class Kijkdoos(tk.Tk):
         if self._player:
             self._stop_poll()
             self._player.stop()
+        self._vlc_playing = False
         self._play_btn.config(text="▶  Play", command=self._play_selected,
                               fg=COLORS["accent"])
         self._now_playing_var.set("Select a channel to watch")
@@ -1105,26 +1171,25 @@ class Kijkdoos(tk.Tk):
 
     def _vu_animate(self):
         """60 fps animation loop: smoothly chase target level."""
+        # Guard: stop loop if widget has been destroyed
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+
         n   = self._VU_BARS
         w   = self._VU_W
         h   = self._VU_H
         bw  = w / n
 
-        # target = set volume / 100 (when playing, optionally modulate)
+        # Use cached play state (updated by poll loop) rather than calling
+        # get_state() at 60 fps which can block the main thread
         target = self._vol_pct / 100.0
-        playing = (self._player and VLC_AVAILABLE and
-                   self._player.get_state() not in
-                   (vlc.State.Stopped, vlc.State.NothingSpecial,
-                    vlc.State.Ended, vlc.State.Error)
-                   if VLC_AVAILABLE else False)
-
-        if playing:
-            # add a tiny random shimmer to simulate audio activity
+        if getattr(self, "_vlc_playing", False):
             import random
             shimmer = random.uniform(-0.08, 0.08)
             target = max(0.0, min(1.0, target + shimmer))
-        else:
-            target = self._vol_pct / 100.0   # static when idle
 
         # smooth chase
         self._vu_level += (target - self._vu_level) * 0.25
@@ -1183,14 +1248,30 @@ class Kijkdoos(tk.Tk):
     def _poll_player(self):
         if not self._player:
             return
-        state = self._player.get_state()
+        try:
+            state = self._player.get_state()
+        except Exception:
+            self._poll_id = self.after(1000, self._poll_player)
+            return
+        # Cache playing state for VU meter (avoids 60fps get_state() calls)
+        self._vlc_playing = VLC_AVAILABLE and state not in (
+            vlc.State.Stopped, vlc.State.NothingSpecial,
+            vlc.State.Ended, vlc.State.Error,
+        )
         if state == vlc.State.Error:
+            self._vlc_playing = False
             self._set_status("✖ Stream error — check URL or your connection",
                              error=True)
             self._show_placeholder()
+            # Bug 3 fix: reset play button on error
+            self._play_btn.config(text="▶  Play", command=self._play_selected,
+                                  fg=COLORS["accent"])
         elif state == vlc.State.Ended:
+            self._vlc_playing = False
             self._set_status("Stream ended")
             self._show_placeholder()
+            self._play_btn.config(text="▶  Play", command=self._play_selected,
+                                  fg=COLORS["accent"])
         else:
             self._poll_id = self.after(1000, self._poll_player)
 
